@@ -1,6 +1,7 @@
 import CoreML
 import CoreVideo
 import Foundation
+import Vision
 
 nonisolated struct SignPrediction: Sendable {
     var label: String
@@ -9,88 +10,38 @@ nonisolated struct SignPrediction: Sendable {
     var top: [(label: String, confidence: Float)]
 }
 
-nonisolated enum SignClassifierError: Error {
-    case unexpectedImage
-    case missingOutput
+/// Szuka skompilowanego modelu o danej nazwie w bundlu aplikacji (Xcode kompiluje `.mlmodel`/`.mlpackage` do `.mlmodelc`).
+nonisolated func compiledModelURL(named name: String) -> URL? {
+    Bundle.main.url(forResource: name, withExtension: "mlmodelc")
 }
 
-/// Cechy dla Random Forest – liczone identycznie jak `features()` w `tools/build_coreml.py`:
-/// jasność 0.299 R + 0.587 G + 0.114 B (0…1) płótna 400×400 uśredniona w blokach 8×8 → 50 × 50 = 2500 liczb,
-/// wiersz po wierszu od góry.
-nonisolated enum SkeletonFeatures {
-    static let grid = 50
-    static let count = grid * grid
-
-    static func extract(_ buffer: CVPixelBuffer) throws -> MLMultiArray {
-        let size = SkeletonImageRenderer.canvasSize
-        let block = size / grid
-        guard CVPixelBufferGetWidth(buffer) == size, CVPixelBufferGetHeight(buffer) == size,
-              CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_32BGRA else {
-            throw SignClassifierError.unexpectedImage
-        }
-
-        CVPixelBufferLockBaseAddress(buffer, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
-        guard let base = CVPixelBufferGetBaseAddress(buffer) else { throw SignClassifierError.unexpectedImage }
-        let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
-        let bytes = base.assumingMemoryBound(to: UInt8.self)
-
-        // Bufor BGRA (premultipliedFirst + byteOrder32Little): w pamięci B, G, R, A. Wiersz 0 = góra obrazka.
-        var sums = [Double](repeating: 0, count: count)
-        for y in 0..<size {
-            let row = bytes + y * bytesPerRow
-            let blockRow = (y / block) * grid
-            for x in 0..<size {
-                let pixel = row + x * 4
-                sums[blockRow + x / block] += 0.299 * Double(pixel[2]) + 0.587 * Double(pixel[1]) + 0.114 * Double(pixel[0])
-            }
-        }
-
-        let features = try MLMultiArray(shape: [NSNumber(value: count)], dataType: .double)
-        let scale = 1 / (255 * Double(block * block))
-        for (index, sum) in sums.enumerated() {
-            features[index] = NSNumber(value: sum * scale)
-        }
-        return features
-    }
-}
-
-/// Model Core ML: obraz szkieletu 400×400 → piksele 50×50 → Random Forest (A–Z).
-/// Szuka w bundlu pierwszego skompilowanego modelu (`*.mlmodelc`) – wystarczy wrzucić `.mlmodel` do folderu `ASSN`.
-nonisolated final class SignClassifier {
+/// PUNKT ODNIESIENIA (poprzednia wersja projektu): obraz szkieletu 224×224 → ResNeXt50 → regresja logistyczna.
+/// Wymaga oryginalnego `ASSN/ASLClassifier.mlpackage` (wejście obrazowe). Bez niego tryb jest niedostępny.
+nonisolated final class ImageSignClassifier {
+    static let resourceName = "ASLClassifier"
     let modelName: String
-    private let model: MLModel
-    private let inputName: String
-    private let probabilitiesName: String
+    private let request: VNCoreMLRequest
 
     init?() {
-        guard let url = Bundle.main.urls(forResourcesWithExtension: "mlmodelc", subdirectory: nil)?.first else { return nil }
+        guard let url = compiledModelURL(named: Self.resourceName) else { return nil }
         let configuration = MLModelConfiguration()
         configuration.computeUnits = .all
+        // VNCoreMLModel odmówi modelu bez wejścia obrazowego – wtedy tryb obrazowy jest po prostu niedostępny.
         guard let model = try? MLModel(contentsOf: url, configuration: configuration),
-              let inputName = model.modelDescription.inputDescriptionsByName.keys.first,
-              let probabilitiesName = model.modelDescription.predictedProbabilitiesName else { return nil }
+              let visionModel = try? VNCoreMLModel(for: model) else { return nil }
 
         modelName = url.deletingPathExtension().lastPathComponent
-        self.model = model
-        self.inputName = inputName
-        self.probabilitiesName = probabilitiesName
+        request = VNCoreMLRequest(model: visionModel)
+        // Płótno jest kwadratowe, więc to po prostu Resize((224, 224)) z notebooka.
+        request.imageCropAndScaleOption = .scaleFill
     }
 
-    /// Prawdopodobieństwa wszystkich klas (średnia głosów drzew).
+    /// Prawdopodobieństwa wszystkich klas.
     func classify(_ image: CVPixelBuffer) throws -> [String: Float] {
-        let input = try MLDictionaryFeatureProvider(
-            dictionary: [inputName: MLFeatureValue(multiArray: SkeletonFeatures.extract(image))]
-        )
-        let output = try model.prediction(from: input)
-        guard let probabilities = output.featureValue(for: probabilitiesName)?.dictionaryValue else {
-            throw SignClassifierError.missingOutput
-        }
-        var result: [String: Float] = [:]
-        for (label, probability) in probabilities {
-            result["\(label)"] = probability.floatValue
-        }
-        return result
+        let handler = VNImageRequestHandler(cvPixelBuffer: image, orientation: .up)
+        try handler.perform([request])
+        let results = request.results as? [VNClassificationObservation] ?? []
+        return Dictionary(results.map { ($0.identifier, $0.confidence) }, uniquingKeysWith: max)
     }
 }
 
@@ -98,7 +49,7 @@ nonisolated final class SignClassifier {
 nonisolated final class PredictionSmoother: @unchecked Sendable {
     var window = 6
     /// Poniżej tego progu nie pokazujemy litery.
-    var minConfidence: Float = 0.5
+    var minConfidence: Float = 0.4
 
     private var history: [[String: Float]] = []
 

@@ -36,6 +36,11 @@ struct ContentView: View {
             Text("Opóźnienie \(Int(model.stats.latencyMs.rounded())) ms · odrzucone \(model.stats.droppedFrames)")
             if let hand = model.handState {
                 Text("Dłoń \(hand.handedness.rawValue) · pewność \(Int(hand.confidence * 100))%")
+                Text("Uzupełnione punkty \(model.diagnostics.filledPoints) · niepewne \(model.diagnostics.lowConfidencePoints)")
+                    .foregroundStyle(model.diagnostics.filledPoints > 0 ? Color.yellow : Color.white)
+                if model.diagnostics.inferenceMs > 0 {
+                    Text("Model \(String(format: "%.1f", model.diagnostics.inferenceMs)) ms")
+                }
             } else {
                 Text("Brak dłoni")
             }
@@ -47,7 +52,7 @@ struct ContentView: View {
         .padding(.top, 40)
     }
 
-    /// Podgląd płótna, które dostaje model – powinno wyglądać jak obrazki z datasetu.
+    /// Wybór modelu + podgląd szkieletu (w trybie ResNeXt to dokładnie wejście sieci).
     private var modelInputPanel: some View {
         VStack(spacing: 6) {
             Group {
@@ -60,12 +65,26 @@ struct ContentView: View {
             .frame(width: 120, height: 120)
             .clipShape(RoundedRectangle(cornerRadius: 6))
 
-            Picker("Kadrowanie", selection: $model.framing) {
-                ForEach(SkeletonFraming.allCases) { Text($0.title).tag($0) }
+            Picker("Model", selection: $model.mode) {
+                ForEach(RecognitionMode.allCases) { Text($0.title).tag($0) }
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .frame(width: 180)
+            .frame(width: 220)
+
+            if model.mode == .image {
+                Picker("Kadrowanie", selection: $model.framing) {
+                    ForEach(SkeletonFraming.allCases) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 220)
+            }
+
+            Toggle("Lustro (jak w datasecie)", isOn: $model.mirror)
+                .font(.caption)
+                .foregroundStyle(.white)
+                .frame(width: 220)
         }
         .padding(8)
         .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 8))
@@ -75,8 +94,9 @@ struct ContentView: View {
     private var predictionPanel: some View {
         VStack(spacing: 4) {
             if model.modelName == nil {
-                Text("Brak modelu – wrzuć plik .mlmodel do folderu ASSN")
+                Text(model.missingModelMessage)
                     .font(.headline)
+                    .multilineTextAlignment(.center)
             } else if let prediction = model.prediction {
                 Text(prediction.label)
                     .font(.system(size: 96, weight: .bold, design: .rounded))
@@ -86,6 +106,16 @@ struct ContentView: View {
                 Text("–")
                     .font(.system(size: 96, weight: .bold, design: .rounded))
                     .opacity(0.4)
+                if let reason = model.diagnostics.skipped, model.handState != nil {
+                    Text(reason)
+                        .font(.callout)
+                        .foregroundStyle(.yellow)
+                }
+            }
+            if let name = model.modelName {
+                Text(name)
+                    .font(.caption2)
+                    .opacity(0.6)
             }
         }
         .foregroundStyle(.white)

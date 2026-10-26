@@ -5,9 +5,40 @@ import CoreVideo
 import Foundation
 import os
 
+/// Sposób rozpoznawania litery.
+nonisolated enum RecognitionMode: String, CaseIterable, Identifiable, Sendable {
+    /// NOWA architektura: punkty Apple Vision → cechy geometryczne → Random Forest.
+    case geometry
+    /// Punkt odniesienia: obraz szkieletu → ResNeXt50 → regresja logistyczna.
+    case image
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .geometry: "Geometria (RF)"
+        case .image: "Obraz (ResNeXt)"
+        }
+    }
+}
+
+/// Diagnostyka jakości punktów i rozpoznawania – pokazywana w aplikacji.
+nonisolated struct RecognitionDiagnostics: Sendable {
+    /// Punkty uzupełnione przez `LandmarkProcessor` (Vision ich nie zwrócił lub miały za niską pewność).
+    var filledPoints = 0
+    /// Punkty zwrócone przez Vision z pewnością < 0.5.
+    var lowConfidencePoints = 0
+    var handConfidence: Float = 0
+    /// Powód pominięcia klasyfikacji (nil = sklasyfikowano).
+    var skipped: String?
+    var inferenceMs: Double = 0
+}
+
 /// Łączy etapy: Frame Manager → Hand Detector → Landmark Processor → Hand Filter → Hand State → rozpoznawanie.
 /// Śledzenie dłoni chodzi na kolejce wideo kamery z pełnym FPS; rozpoznawanie na osobnej kolejce
 /// i pomija klatki, gdy model jeszcze liczy poprzednią – dzięki temu nie spowalnia podglądu.
+///
+/// Tryb geometryczny: HandState → VisionFeatureExtractor → GeometrySignClassifier (Random Forest) → PredictionSmoother.
+/// Szkielet jest wtedy rysowany wyłącznie jako podgląd – nie jest wejściem klasyfikatora.
 nonisolated final class HandTrackingPipeline: @unchecked Sendable {
     private let frameManager: FrameManager
     private let detector = HandDetector()
@@ -15,18 +46,27 @@ nonisolated final class HandTrackingPipeline: @unchecked Sendable {
     private let filter = HandFilter()
 
     private let renderer = SkeletonImageRenderer()
-    private let classifier = SignClassifier()
+    private let geometryClassifier = GeometrySignClassifier()
+    private let imageClassifier = ImageSignClassifier()
     private let smoother = PredictionSmoother()
+    /// Stan zmieniany tylko na kolejce rozpoznawania.
+    private var mode: RecognitionMode = .geometry
+    private var mirror = true
+    /// Więcej uzupełnionych punktów = nie klasyfikujemy (cechy byłyby w dużej części zgadywane).
+    private let maxFilledPoints = 3
     private let recognitionQueue = DispatchQueue(label: "asl.recognition", qos: .userInitiated)
     private let isRecognizing = OSAllocatedUnfairLock(initialState: false)
     private let log = Logger(subsystem: "MyApp", category: "Pipeline")
 
-    var modelName: String? { classifier?.modelName }
+    /// Nazwy dostępnych modeli (nil = brak pliku modelu).
+    var geometryModelName: String? { geometryClassifier?.modelName }
+    var imageModelName: String? { imageClassifier?.modelName }
+    var geometryLoadError: String? { GeometrySignClassifier.lastLoadError }
 
     /// Wywoływane na kolejce wideo po każdej klatce.
     var onHandState: ((HandState?, FrameStats) -> Void)?
-    /// Wywoływane na kolejce rozpoznawania. Obraz to dokładnie to, co dostaje model.
-    var onPrediction: ((SignPrediction?, CGImage?) -> Void)?
+    /// Wywoływane na kolejce rozpoznawania. Obraz = podgląd szkieletu (w trybie obrazowym to wejście ResNeXt).
+    var onPrediction: ((SignPrediction?, CGImage?, RecognitionDiagnostics) -> Void)?
 
     init(camera: CameraManager) {
         frameManager = FrameManager(clock: camera.session.synchronizationClock ?? CMClockGetHostTimeClock())
@@ -38,6 +78,22 @@ nonisolated final class HandTrackingPipeline: @unchecked Sendable {
         recognitionQueue.async { [renderer, smoother] in
             renderer.framing = framing
             smoother.reset()
+        }
+    }
+
+    func setMode(_ mode: RecognitionMode) {
+        recognitionQueue.async { [weak self] in
+            self?.mode = mode
+            self?.smoother.reset()
+        }
+    }
+
+    /// Lustro = widok selfie jak w datasecie. Wyłącz, gdy pokazujesz znaki drugą dłonią niż w danych treningowych.
+    func setMirror(_ mirror: Bool) {
+        recognitionQueue.async { [weak self] in
+            self?.mirror = mirror
+            self?.renderer.mirror = mirror
+            self?.smoother.reset()
         }
     }
 
@@ -80,7 +136,7 @@ nonisolated final class HandTrackingPipeline: @unchecked Sendable {
         guard let state else {
             recognitionQueue.async { [smoother, onPrediction] in
                 smoother.reset()
-                onPrediction?(nil, nil)
+                onPrediction?(nil, nil, RecognitionDiagnostics(skipped: "Brak dłoni"))
             }
             return
         }
@@ -94,17 +150,48 @@ nonisolated final class HandTrackingPipeline: @unchecked Sendable {
         recognitionQueue.async { [weak self] in
             guard let self else { return }
             defer { self.isRecognizing.withLock { $0 = false } }
-            guard let image = self.renderer.render(state) else { return }
-            guard let classifier = self.classifier else {
-                self.onPrediction?(nil, Self.makeCGImage(image))
+
+            var diagnostics = RecognitionDiagnostics(
+                filledPoints: state.pointConfidences.filter { $0 == 0 }.count,
+                lowConfidencePoints: state.pointConfidences.filter { $0 > 0 && $0 < 0.5 }.count,
+                handConfidence: state.confidence
+            )
+            let preview = self.renderer.render(state)
+            let previewImage = preview.flatMap { Self.makeCGImage($0) }
+
+            if diagnostics.filledPoints > self.maxFilledPoints {
+                diagnostics.skipped = "Za dużo brakujących punktów (\(diagnostics.filledPoints))"
+                self.smoother.reset()
+                self.onPrediction?(nil, previewImage, diagnostics)
                 return
             }
+
+            let started = CFAbsoluteTimeGetCurrent()
             do {
-                let probabilities = try classifier.classify(image)
+                let probabilities: [String: Float]
+                switch self.mode {
+                case .geometry:
+                    guard let classifier = self.geometryClassifier else {
+                        diagnostics.skipped = GeometrySignClassifier.lastLoadError ?? "Brak modelu geometrycznego"
+                        self.onPrediction?(nil, previewImage, diagnostics)
+                        return
+                    }
+                    probabilities = try classifier.classify(state, mirror: self.mirror)
+                case .image:
+                    guard let classifier = self.imageClassifier, let preview else {
+                        diagnostics.skipped = "Brak modelu ResNeXt (ASLClassifier.mlpackage)"
+                        self.onPrediction?(nil, previewImage, diagnostics)
+                        return
+                    }
+                    probabilities = try classifier.classify(preview)
+                }
+                diagnostics.inferenceMs = (CFAbsoluteTimeGetCurrent() - started) * 1000
                 let prediction = self.smoother.add(probabilities)
-                self.onPrediction?(prediction, Self.makeCGImage(image))
+                self.onPrediction?(prediction, previewImage, diagnostics)
             } catch {
                 self.log.error("Core ML: \(error.localizedDescription)")
+                diagnostics.skipped = "Błąd modelu: \(error.localizedDescription)"
+                self.onPrediction?(nil, previewImage, diagnostics)
             }
         }
     }

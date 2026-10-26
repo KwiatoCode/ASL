@@ -3,4 +3,7 @@ xcuserdata/
 __pycache__/
 .venv/
 *.pkl
+*.joblib
 *.npz
+wyniki_*/
+landmarks*.csv

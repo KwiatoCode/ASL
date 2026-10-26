@@ -1,260 +1,205 @@
-# ASSN — rozpoznawanie alfabetu ASL w czasie rzeczywistym
+# ASSN — rozpoznawanie alfabetu ASL: Apple Vision + geometria dłoni + Random Forest
 
-Notebook bazowy (Kaggle, wersja z ResNeXt): https://www.kaggle.com/code/mikedelong/f1-0-99-with-logistic-regression-and-resnext
+> Kamera iPhone'a → **Apple Vision** (21 punktów dłoni) → normalizacja → **110 cech geometrycznych** → **Random Forest** → litera A–Z
 
-Link dataset: https://www.kaggle.com/datasets/usifelshafie/american-sign-language-asl-hand-skeleton-dataset
+Bez sieci neuronowej i bez obrazu jako wejścia klasyfikatora. Szkielet jest rysowany już tylko jako podgląd.
+Poprzednia wersja (obraz szkieletu → ResNeXt-50 → regresja logistyczna) jest zachowana jako punkt odniesienia
+i można ją wybrać przełącznikiem w aplikacji.
 
-> Kamera → szkielet dłoni → obraz 400×400 → **piksele 50×50** → **Random Forest** → litera A–Z
-
-Aplikacja na iOS i macOS (SwiftUI + Apple Vision + Core ML).
-Projekt: `~/Desktop/ASSN/ASSN.xcodeproj`
+Instrukcja krok po kroku (Windows → Mac → iPhone): **[INSTRUKCJA.md](INSTRUKCJA.md)**.
 
 ---
 
-## 1. Przepływ danych — od fotonu do litery
+## 0. Stan prac – co jest sprawdzone, a co nie
+
+| Element | Stan |
+|---|---|
+| Ekstraktor cech (Python) | gotowy, testy jednostkowe przechodzą (niezmienniczość, znane wartości) |
+| Ekstraktor cech (Swift) | napisany wzór w wzór; **test zgodności Swift ↔ Python czeka na uruchomienie na Macu** (`swiftc`) |
+| Rekonstrukcja punktów z obrazów datasetu | gotowa i zmierzona: przyjmuje ~52 % obrazów próbki, przyjęte w ~98,6 % poprawne (test syntetyczny); słabe litery C, G, J, O, P, Q, T, Z (rozdz. 3) |
+| Alternatywne dane (zdjęcia + MediaPipe) | skrypt gotowy; **nie uruchomiony** (zbiór trzeba pobrać na Windowsie) – potrzebny do słabych liter |
+| Trening, strojenie, raport | gotowe, przetestowane na danych syntetycznych |
+| Eksport do Core ML + weryfikacja | gotowe; matematyka drzew sprawdzona testem (zgodność z `predict_proba` do 1e-12); samo `coremltools` uruchamia się u Ciebie |
+| Aplikacja SwiftUI | zmodyfikowana; **nieskompilowana** (brak Xcode w moim środowisku) |
+| Wytrenowany model `ASLGeometryRF.mlmodel` | **brak** – powstaje dopiero po uruchomieniu treningu na prawdziwych danych; w repozytorium nie ma atrapy modelu |
+| Test na iPhonie | **niewykonany** |
+
+---
+
+## 1. Przepływ danych
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  ① KAMERA  · AVFoundation                                                      │
-│     CVPixelBuffer BGRA  640×480 (iPhone w pionie: 480×640)  · do 60 FPS        │
-│     klatka obrócona fizycznie do pionu, NIE odbita lustrzanie                  │
-└───────────────────────────────────┬──────────────────────────────────────────┘
-                                    ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  ② FRAME MANAGER                                                               │
-│     odrzuca klatki starsze niż 100 ms i klatki spóźnione (alwaysDiscardsLate)  │
-│     mierzy FPS (EMA) i opóźnienie kamera → wynik                               │
-└───────────────────────────────────┬──────────────────────────────────────────┘
-                                    ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  ③ HAND DETECTOR  · Apple Vision  VNDetectHumanHandPoseRequest                 │
-│     → 21 × (x, y, pewność)  w układzie Vision (0…1, początek: lewy DÓŁ)        │
-│     → strona dłoni (left / right)                                              │
-└───────────────────────────────────┬──────────────────────────────────────────┘
-                                    ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  ④ LANDMARK PROCESSOR                                                          │
-│     • odrzuca punkty z pewnością < 0.3 i całą dłoń z pewnością < 0.5           │
-│     • wymaga ≥ 14 / 21 dobrych punktów                                         │
-│     • y → 1 − y  (układ MediaPipe: początek w lewym GÓRNYM rogu)               │
-│     • kolejność punktów Vision → kolejność MediaPipe (0 = nadgarstek…20)       │
-│     • braki: poprzednia klatka (≤ 250 ms) → interpolacja w palcu → ekstrapol.  │
-└───────────────────────────────────┬──────────────────────────────────────────┘
-                                    ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  ⑤ HAND FILTER  · One Euro Filter  (42 filtry: x i y każdego punktu)           │
-│     filtrowanie w pikselach · minCutoff 1.0 Hz · β 0.02 · reset po 300 ms      │
-│     wolny ruch → mocne wygładzanie,  szybki ruch → małe opóźnienie             │
-└───────────────────────────────────┬──────────────────────────────────────────┘
-                                    ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  ⑥ HAND STATE   21 × CGPoint · pewności · strona dłoni · timestamp · rozmiar   │
-│                 (Codable → JSON)                                               │
-└──────────────┬───────────────────────────────────────────────┬───────────────┘
-               ▼                                               ▼
-┌─────────────────────────────┐   ┌────────────────────────────────────────────┐
-│  ⑦ RENDERER (podgląd)        │   │  ⑧ SKELETON IMAGE RENDERER  (wejście sieci) │
-│  kamera + overlay            │   │  płótno 400×400, białe tło, styl datasetu  │
-│  zielone punkty, czerwone    │   │  odbicie lustrzane + kadrowanie            │
-│  linie, aspect-fill, lustro  │   └──────────────────────┬─────────────────────┘
-└─────────────────────────────┘                          ▼
-                                  ┌────────────────────────────────────────────┐
-                                  │  ⑨ MODEL  · Core ML  (rozdział 3)          │
-                                  │  400×400 → jasność w blokach 8×8 → 2500    │
-                                  │  → Random Forest (100 drzew) → 26 klas     │
-                                  └──────────────────────┬─────────────────────┘
+ ① KAMERA (AVFoundation)  ─►  ② FRAME MANAGER  ─►  ③ HAND DETECTOR · Apple Vision VNDetectHumanHandPoseRequest
+                                                         │  21 × (x, y, pewność), strona dłoni
                                                          ▼
-                                  ┌────────────────────────────────────────────┐
-                                  │  ⑩ PREDICTION SMOOTHER                     │
-                                  │  średnia z 6 ostatnich wyników · próg 0.5  │
-                                  │  → litera + top-3                          │
-                                  └────────────────────────────────────────────┘
+                                                   ④ LANDMARK PROCESSOR  (walidacja, układ MediaPipe, uzupełnianie)
+                                                         ▼
+                                                   ⑤ ONE EURO FILTER  ─►  ⑥ HAND STATE ──► podgląd (zielone punkty)
+                                                         ▼
+                              ┌──────────── tryb „Geometria (RF)” (domyślny) ────────────┐
+                              │ ⑦ VisionFeatureExtractor  – 110 cech geom-v1              │
+                              │ ⑧ GeometrySignClassifier  – Random Forest (Core ML)      │
+                              └──────────────────────────────────────────────────────────┘
+                              ┌──────────── tryb „Obraz (ResNeXt)” – punkt odniesienia ───┐
+                              │ SkeletonImageRenderer 400×400 → ResNeXt-50 → regresja log. │
+                              └──────────────────────────────────────────────────────────┘
+                                                         ▼
+                                                   ⑨ PREDICTION SMOOTHER  (6 klatek, próg 0.4, top-3)
+                                                         ▼
+                                                   ⑩ RecognitionViewModel → interfejs
 ```
 
-### Wątki
-
-| Kolejka | Etapy | Tempo |
-|---|---|---|
-| `asl.camera.video` | ① – ⑥ | każda klatka, do 60 FPS |
-| `asl.recognition` | ⑧ – ⑩ | tyle, ile zdąży model; gdy jest zajęty, klatka jest **pomijana**, a nie kolejkowana |
-| main | ⑦, UI | odświeżanie SwiftUI |
-
-Dzięki temu podgląd ze szkieletem chodzi płynnie, nawet gdy model liczy wolniej niż kamera.
+Kolejki: `asl.camera.video` (①–⑥, pełny FPS), `asl.recognition` (⑦–⑨, klatka pomijana, gdy model liczy),
+główna – tylko UI. Diagnostyka w aplikacji: punkty uzupełnione / niepewne, pewność dłoni, czas modelu;
+przy > 3 uzupełnionych punktach klasyfikacja jest pomijana (komunikat zamiast zgadywania).
 
 ---
 
-## 2. Wejście modelu — obraz szkieletu (krok ⑧)
+## 2. Zgodność Apple Vision ↔ dane treningowe
 
-Model uczył się na datasecie **[ASL Hand Skeleton](https://www.kaggle.com/datasets/usifelshafie/american-sign-language-asl-hand-skeleton-dataset)**.
-To 26 000 **obrazków** szkieletu narysowanych przez `mediapipe.drawing_utils`, a nie współrzędne.
-Dlatego aplikacja odtwarza ten sam styl rysowania. Parametry zmierzyłem na obrazkach z datasetu:
+| Kwestia | Dataset szkieletów | Aplikacja (Vision) | Ujednolicenie |
+|---|---|---|---|
+| Kolejność stawów | MediaPipe 0…20 | nazwy Vision | `HandJoint` = kolejność MediaPipe |
+| Początek układu / oś Y | lewy górny róg, Y w dół | lewy **dolny**, Y w górę | `LandmarkProcessor`: y → 1 − y |
+| Proporcje osi | płótno 400×400 z kadru 640×480 (X ściśnięte) | 0…1 względem klatki | oba na izotropowe piksele: X·640/400, Y·480/400 / X·W, Y·H |
+| Odbicie lustrzane | nagrania selfie (lustro) | klatka nieodbita | aplikacja odbija X (przełącznik „Lustro”) |
+| Lewa / prawa dłoń | nieznana | `chirality` | opcja `canonical` w cechach (wybierana eksperymentem) lub przełącznik „Lustro” |
+| Orientacja kamery | – | klatka obrócona do pionu przed Vision | bez zmian |
+| Brakujące punkty | brak | uzupełniane, oznaczane | pominięcie klasyfikacji przy > 3 uzupełnionych |
+| Położenie i wielkość dłoni | – | – | cechy względem nadgarstka, skala = średnia nadgarstek → MCP |
 
-```
-        przykład z datasetu (litera L)          parametry rysowania
-     ┌──────────────────────────────┐
-     │            ●                 │      płótno   400 × 400, białe tło
-     │            │                 │      kości    21 połączeń MediaPipe
-     │            ●                 │               czerwone (255,0,0), grubość 2
-     │            │                 │      stawy    zielone (0,255,0), r = 2,
-     │            ●   ●  ●  ●       │               biała obwódka r = 3
-     │  ●         │  ╱│ ╱│ ╱│       │      widok    lustrzany (selfie)
-     │   ╲        ● ● ● ● ●  ●      │
-     │    ●       │╲ ╲│╱  ╱ ╱       │      zgodność z cv2 po skalowaniu
-     │     ╲      │ ╲ │ ╱ ╱         │      do 224×224: średnio 0.3/255
-     │      ●     │  ╲│╱╱           │      na piksel
-     │       ╲    │   ●             │
-     │        ●───┴──╱              │
-     │                              │
-     └──────────────────────────────┘
-```
+Normalizacja nie usuwa różnic perspektywy ani różnic między detektorami (MediaPipe ≠ Vision). Dlatego są:
+test odporności na szum/obrót/skalę (`train_geometry_rf.py`), test przenoszenia między zbiorami oraz
+`compare_detectors.py` + `vision_landmarks` (Vision i MediaPipe na tych samych zdjęciach – uruchamiane na Macu).
 
-**Kadrowanie** (przełącznik w aplikacji):
+---
 
-| Tryb | Przekształcenie punktów |
+## 3. Dane treningowe
+
+### 3.1 Dataset szkieletów z Kaggle nie ma współrzędnych
+
+[ASL Hand Skeleton Dataset](https://www.kaggle.com/datasets/usifelshafie/american-sign-language-asl-hand-skeleton-dataset)
+to 26 000 plików JPG (26 × 1000), bez CSV ze współrzędnymi. Obrazy narysowano `mediapipe draw_landmarks`:
+21 czerwonych kości, potem 21 punktów (biała obwódka r = 3 + zielone koło r = 2), na płótnie 400×400.
+
+### 3.2 Rekonstrukcja punktów z rysunków (`tools/geometry/`)
+
+1. Maski kolorów (odporne na JPEG), zielone plamy → kandydaci; zlane plamy dzielone (punkty nałożone).
+2. Pokrycie każdego odcinka czerwoną kością (z pominięciem obwódek punktów).
+3. **Kolejność rysowania**: MediaPipe rysuje punkty 0…20 po kolei, a obwódka późniejszego nadgryza wcześniejszy.
+   Dla punktów bliższych niż 6 px kolejność odczytuje się trafnie w 97–100 % (pomiar na syntetycznych rysunkach).
+4. Przeszukiwanie wiązkowe przypisań staw → kandydat zgodnych z 21 kośćmi MediaPipe (najpierw śródręcze).
+5. Ocena globalna: zgodność narysowanego rozwiązania z czerwonymi pikselami (recall × precision) + anatomia.
+   **Strona dłoni**: podstawa kciuka (CMC) leży po tej samej stronie osi dłoni co MCP wskazującego – rozstrzyga
+   odbicie wskazujący ↔ mały nawet przy kciuku schowanym w pięści (100 % trafnych na danych syntetycznych).
+6. **Etap 2 – na poziomie litery (EM)**: rysunek bywa niejednoznaczny (pięść, punkty na jednej prostej, odbicie
+   wskazujący ↔ mały). Wszystkie obrazy litery budują model kształtu; każdy obraz wybiera wariant zgodny z rysunkiem
+   i z kształtem litery; potem szablony liter kierują ponownym przeszukiwaniem (2 przebiegi).
+7. Obraz jest **odrzucany**, gdy zwycięzca nie wygrywa wyraźnie, rysunek jest słaby albo kształt nietypowy –
+   zamiast zgadywać.
+
+**Pomiar wiarygodności** (szczegóły: [tools/geometry/RAPORT_WALIDACJI.md](tools/geometry/RAPORT_WALIDACJI.md)):
+
+| Test | Wynik |
 |---|---|
-| **Kamera** | `(x, y) × 400`, dokładnie jak w datasecie (kamera 640×480 rysowana na kwadracie) |
-| **Normalizacja** (domyślnie) | dłoń przeskalowana tak, by odległość nadgarstek → MCP środkowego palca wynosiła **130 px**; oś X ściśnięta o **480/640** (jak w datasecie); środek dłoni przesunięty do **(188, 209)** — średnia z datasetu |
+| Syntetyczne „litery” ze znaną prawdą (20 liter × 25, trudniejsze niż dataset) | najlepszy wariant poprawny w 90,8 %; przyjęte 14 %, z nich **1,4 % z błędną numeracją** |
+| Prawdziwa próbka datasetu (1040 obrazów, co 25. plik) | przyjęte **52 %**; kontrola wzrokowa wszystkich liter: wiarygodne poza Q (2 obrazy, prawdopodobnie odbite); **P odrzucone automatycznie** (dłoń bokiem); słabe pokrycie C, G, J, O, Q, T, Z |
+
+**Wniosek:** rekonstrukcja daje wiarygodne punkty dla około połowy obrazów i większości liter. Dla liter z dłonią
+bokiem lub w dół (P, Q, G) i zakrzywionych (C, O) brakuje danych albo jest ryzyko odbicia – te litery trzeba
+uzupełnić innym źródłem. Po przetworzeniu pełnego datasetu obejrzyj `qa/` i tabelę kontroli strony dłoni. Dlatego:
+
+### 3.3 Alternatywne dane z oryginalnymi punktami
+
+`extract_landmarks_mediapipe.py` – punkty MediaPipe z prawdziwych zdjęć dłoni z podfolderami liter, np.
+**ASL-HG** (Pranto i in., *Data in Brief* 2026, [Mendeley Data](https://data.mendeley.com/datasets/j4y5w2c8w9/1)):
+zdjęcia A–Z i 0–9; według [opisu modelu na tym zbiorze](https://huggingface.co/nocontextdoruk/asl-landmark-mlp)
+MediaPipe znajduje dłoń na ~31 tys. zdjęć. To nadal **punkty MediaPipe, nie Apple Vision** – różnicę mierzy
+`compare_detectors.py` (te same zdjęcia przez Vision na Macu). Licencję i zgodność alfabetu sprawdź na stronie zbioru
+przed użyciem; nie zweryfikowałem ich, bo nie mam dostępu do pobrania.
+
+Trening może łączyć źródła (`--landmarks a.csv b.csv`); raport pokazuje wtedy też trening na jednym źródle i test na
+drugim – najlepszą dostępną bez nagrywania miarę, czy model przenosi się na inne dłonie i inny detektor.
 
 ---
 
-## 3. Architektura modelu
+## 4. Cechy geometryczne `geom-v1`
 
-Jeden plik Core ML `ASLClassifier.mlmodel` (tree ensemble). Zawiera tylko las losowy;
-cechy liczy aplikacja (`SkeletonFeatures` w `SignClassifier.swift`) dokładnie tak samo jak Python (`features()` w `tools/build_coreml.py`).
+Specyfikacja: `tools/geometry/hand_features.py` (referencja) = `ASSN/Recognition/VisionFeatureExtractor.swift`.
 
-```
- obraz szkieletu 400×400 RGB  (ten sam co wcześniej, krok ⑧)
-          │
-          ▼
- ┌───────────────────────────────────────────────────────────────────┐
- │ JASNOŚĆ     0.299 R + 0.587 G + 0.114 B,  / 255  →  [0, 1]          │
- ├───────────────────────────────────────────────────────────────────┤
- │ ŚREDNIA     w blokach 8×8 pikseli     400×400  →  50×50            │
- ├───────────────────────────────────────────────────────────────────┤
- │ WEKTOR      wiersz po wierszu, od góry                →  2500      │
- ╞═══════════════════════════════════════════════════════════════════╡
- │                 RANDOM FOREST (sklearn → Core ML)                  │
- ├───────────────────────────────────────────────────────────────────┤
- │ 100 drzew decyzyjnych, pełna głębokość, √2500 = 50 cech na podział │
- │ każde drzewo głosuje na literę                                     │
- │ prawdopodobieństwo = średnia z drzew  (predict_proba)              │
- ├───────────────────────────────────────────────────────────────────┤
- │ WYJŚCIE  classLabel  (A…Z)  ·  classProbability  {A: p, …, Z: p}   │
- └───────────────────────────────────────────────────────────────────┘
-```
-
-### Dlaczego piksele 50×50
-
-Random Forest nie ma warstw konwolucyjnych, więc dostaje obraz bezpośrednio jako liczby.
-Pełne 400×400×3 = 480 000 cech byłoby za dużo, a szkielet jest prosty (czerwone linie i zielone punkty na białym tle),
-więc uśrednienie bloków 8×8 zachowuje kształt dłoni. Uśrednianie bloków (a nie skalowanie obrazka)
-daje w Swift i w Pythonie identyczny wynik — różnica w teście: ~1e-15.
-
-### Parametry
-
-| Część | Parametry | Trenowane? |
+| Grupa | Opis | Liczba |
 |---|---|---|
-| Cechy pikselowe | brak (stała formuła) | nie |
-| Random Forest | 100 drzew (`n_estimators=100`, `random_state=2025`) | tak (`random_forest.pkl`) |
+| A | x, y stawów 1…20 względem nadgarstka, w jednostkach śródręcza | 40 |
+| B1 | odległości stawów od nadgarstka | 20 |
+| B2 | odległości między czubkami palców | 10 |
+| B3 | czubki palców – środek dłoni | 5 |
+| B4 | prostoliniowość palca (czubek–podstawa / suma paliczków) | 5 |
+| C1 | zgięcia MCP/PIP/DIP (kciuk CMC/MCP/IP), 0 = prosto | 15 |
+| C2 | rozstaw sąsiednich palców, kciuk–wskazujący | 4 |
+| C3 | kciuk względem wskazującego i środkowego, położenie wzdłuż/w poprzek osi dłoni | 5 |
+| D | kierunek osi dłoni i linii MCP, strona dłoni (iloczyn wektorowy), proporcja śródręcza | 6 |
+| **basic** | A + B1 + oś dłoni + iloczyn wektorowy | **63** |
+| **extended** | wszystkie | **110** |
 
-### Trening (`random_forest_asl.ipynb`)
-
-```
- dataset 26 × 1000 obrazków
-        │  500 / literę
-        ▼
- piksele 50×50  →  wektor 2500
-        │
-        ▼
- train/test split 75 / 25 (stratify, seed 2025)
-        │
-        ▼
- RandomForestClassifier(n_estimators=100, random_state=2025)   →   accuracy, F1, classification report
-```
-
-Reszta notebooka bez zmian: t-SNE na cechach, wykres bokeh, histogram prawdopodobieństw.
-
-### Strojenie hiperparametrów (`tools/tune_random_forest.py`)
-
-GridSearchCV na części treningowej (5-fold, metryka F1 ważone), potem ocena najlepszego zestawu na części testowej
-i porównanie z lasem o domyślnych parametrach.
-
-| parametr | wartości |
-|---|---|
-| `n_estimators` | 50, 100, 200, 300 |
-| `max_depth` | None, 10, 20, 30 |
-| `max_features` | sqrt, log2 |
-| `min_samples_leaf` | 1, 2, 4 |
-
-96 zestawów × 5 podziałów = 480 treningów. Wyniki (tabele i wykresy do sprawozdania) trafiają do `wyniki_strojenia/`:
-`podsumowanie.md`, `wszystkie_wyniki.csv`, `raport_klasyfikacji.txt`, wykresy wpływu parametrów i macierz pomyłek,
-oraz najlepszy las `random_forest.pkl`.
-
-```bash
-python tools/tune_random_forest.py --train <dataset>            # strojenie
-python tools/tune_random_forest.py --train <dataset> --export   # + ASLClassifier.mlmodel z najlepszego lasu
-```
-
-### Konwersja do Core ML (`tools/build_coreml.py`)
-
-```
- random_forest.pkl ──► coremltools.converters.sklearn.convert
-                         wejście  features: MultiArray(2500)
-                         wyjście  classLabel + classProbability
-                                           ▼
-                             ASSN/ASLClassifier.mlmodel
-```
+Wersja cech, zestaw i wybrane indeksy są zapisywane w metadanych modelu Core ML; aplikacja odrzuca model o innej
+wersji. Skala: średnia odległość nadgarstek → MCP 5, 9, 13, 17. Bez obrotu – orientacja należy do znaku (K/P, H/U, G/Q).
 
 ---
 
-## 4. Mapa kodu
+## 5. Trening i ocena (`train_geometry_rf.py`)
+
+- **Podział grupowy**: sąsiednie numery plików to najpewniej klatki tego samego nagrania. Grupa = litera + blok
+  100 kolejnych numerów; test = ~20 % bloków każdej litery, nigdy nie używany do strojenia; walidacja krzyżowa po blokach.
+  Metadanych sesji brak – bloki to ostrożne przybliżenie (dwa nagrania mogą dzielić blok, jedno nagranie może
+  przekraczać granicę bloku).
+- **Analiza przecieku**: ten sam model przy podziale losowym i grupowym + odległość do najbliższego sąsiada.
+- **Eksperymenty**: basic / extended × strona dłoni none / canonical; potem siatka `n_estimators` 100/200/300/500,
+  `max_depth` None/16/24/32, `min_samples_leaf` 1/2/4, `class_weight="balanced_subsample"`.
+- **Augmentacja** (tylko część treningowa, po podziale na bloki): 3 kopie każdej próbki z szumem położenia stawów
+  2,5 % śródręcza i obrotem dłoni ±10° – odporność na różnice MediaPipe ↔ Apple Vision. Obrót jest mały, bo K/P, H/U,
+  G/Q różnią się orientacją; skalowania nie ma, bo cechy są normalizowane. Raport porównuje model z augmentacją
+  i bez niej. Na danych syntetycznych (sprawdzenie kodu): F1 w walidacji bez zmian, a trafność przy szumie 10 %
+  0,914 → 0,967 i przy obrocie ±20° 0,967 → 0,994. Opcje: `--augment N` (0 = wyłączona), `--aug-noise`, `--aug-rotate`.
+- **Raport**: accuracy, precision, recall, F1 macro i weighted, wyniki per litera, macierz 26×26, mylone pary,
+  ważność cech (permutacyjna na teście), odporność (szum 2/5/10 % śródręcza, obrót ±10/20°, skala ±30 %) –
+  dla modelu z augmentacją i bez niej.
+
+## 6. Eksport (`export_geometry_coreml.py`)
+
+Zespół drzew Core ML budowany **wprost z drzew scikit-learn** (bez konwertera sklearn z coremltools, który obsługuje
+tylko wybrane wersje scikit-learn): liść = rozkład klas / liczba drzew, tak jak `predict_proba`. Weryfikacja odczytuje
+drzewa z zapisanej specyfikacji Core ML i przelicza zbiór testowy w Pythonie – zgodność liter i różnica
+prawdopodobieństw (próg 1e-4). Aplikacja zaokrągla cechy do float32, tak jak scikit-learn wewnętrznie.
+
+## 7. Litery J i Z
+
+J i Z to ruch. Model statyczny widzi jedną klatkę (w datasecie też są pojedyncze klatki), więc rozpoznaje co najwyżej
+charakterystyczną pozę początkową. Nie twierdzę, że rozpoznaje te znaki. Klasyfikator trajektorii wymagałby sekwencji
+punktów z czasem – takich danych tu nie ma.
+
+## 8. Mapa kodu
 
 | Etap | Plik |
 |---|---|
-| ① kamera | `ASSN/Camera/CameraManager.swift` |
-| ② frame manager | `ASSN/Camera/FrameManager.swift` |
-| ③ detektor | `ASSN/Tracking/HandDetector.swift` · `HandJoint.swift` |
-| ④ przetwarzanie | `ASSN/Tracking/LandmarkProcessor.swift` |
-| ⑤ filtr | `ASSN/Tracking/OneEuroFilter.swift` |
-| ⑥ stan | `ASSN/Tracking/HandState.swift` |
-| ①–⑩ orkiestracja | `ASSN/Tracking/HandTrackingPipeline.swift` |
-| ⑦ podgląd | `ASSN/UI/CameraPreviewView.swift` · `HandOverlayView.swift` |
-| ⑧ płótno | `ASSN/Recognition/SkeletonImageRenderer.swift` |
-| ⑨ ⑩ cechy + Random Forest + wygładzanie | `ASSN/Recognition/SignClassifier.swift` |
-| konwersja / trening | `tools/build_coreml.py` · `random_forest_asl.ipynb` |
+| kamera, klatki | `ASSN/Camera/CameraManager.swift`, `FrameManager.swift` |
+| Vision, punkty, filtr | `ASSN/Tracking/HandDetector.swift`, `HandJoint.swift`, `LandmarkProcessor.swift`, `OneEuroFilter.swift` |
+| potok, tryby, diagnostyka | `ASSN/Tracking/HandTrackingPipeline.swift` |
+| cechy | `ASSN/Recognition/VisionFeatureExtractor.swift` (+ `+Vision.swift`) |
+| Random Forest | `ASSN/Recognition/GeometrySignClassifier.swift` |
+| ResNeXt (odniesienie), wygładzanie | `ASSN/Recognition/SignClassifier.swift`, `SkeletonImageRenderer.swift` |
+| UI | `ASSN/ContentView.swift`, `ASSN/UI/*` |
+| rekonstrukcja punktów | `tools/geometry/reconstruct_skeleton.py`, `resolve_letters.py`, `pipeline_landmarks.py` |
+| alternatywne dane | `tools/geometry/extract_landmarks_mediapipe.py`, `vision_landmarks/main.swift`, `compare_detectors.py` |
+| cechy, trening, eksport | `tools/geometry/hand_features.py`, `train_geometry_rf.py`, `export_geometry_coreml.py` |
+| testy | `tools/geometry/tests/` (unittest, syntetyczna walidacja, zgodność Swift ↔ Python) |
+| poprzednie wersje | `tools/resnext_reference/` (ResNeXt + regresja), `tools/pixel_rf_experiment/` (RF na pikselach – działał źle na żywo) |
 
----
+## 9. Ograniczenia i dalsze kroki
 
-## 5. Ograniczenia i kierunki rozwoju
+- Brak danych z Apple Vision w treningu – wszystkie dane to MediaPipe (odtworzone lub z MediaPipe na zdjęciach).
+- Rekonstrukcja z rysunków: nierówne pokrycie liter (P, Q, G, C, O, J, Z słabo); odrzucanie ogranicza błędy kosztem danych.
+- Wyniki testowe dotyczą tych samych zbiorów; rzeczywistą skuteczność trzeba zmierzyć w aplikacji (pokazując litery).
+- Dalej: (1) punkty Apple Vision z publicznych zdjęć jako dodatkowe dane treningowe (narzędzie `vision_landmarks` już
+  je zapisuje), (2) augmentacja szumem/obrotem przy treningu, (3) klasyfikator sekwencji dla J i Z.
 
-**Ograniczenia:**
-- **MediaPipe kontra Apple Vision.** Model widział szkielety z MediaPipe, a aplikacja daje szkielety z Vision.
-  Różnice są największe przy zaciśniętej dłoni (A, E, M, N, S, T).
-- **Brak augmentacji.** Model uczył się na 500 obrazkach na literę, bez przesunięć, obrotów i skali,
-  więc jest wrażliwy na kadrowanie.
-- **J i Z** to litery z ruchem, a w datasecie są pojedynczymi klatkami.
-- **Random Forest na pikselach** jest wrażliwszy na przesunięcie dłoni niż sieć konwolucyjna — dlatego ważne jest kadrowanie *Normalizacja*.
-- **Prawdopodobieństwa lasu** to udział głosujących drzew, więc są zwykle niższe niż z regresji logistycznej; próg wygładzania to nadal 0.5.
-
-**Kierunki rozwoju:**
-- **A.** Dotrenowanie lasu na obrazkach z augmentacją (przesunięcie, skala, obrót, szum punktów).
-- **B.** Model na współrzędnych: 42 liczby z Vision → MLP → 26 klas, uczony na danych z iPhone'a.
-  Działa na tych samych danych co na żywo.
-
----
-
-## 6. Uruchomienie (skrót)
-
-```bash
-# przebudowanie modelu
-python tools/build_coreml.py --model random_forest.pkl     # z lasu z notebooka
-python tools/build_coreml.py --train <dataset> --count 500 # trening jak w notebooku
-```
-
-Przed uruchomieniem usuń stary `ASSN/ASLClassifier.mlpackage` (ResNeXt) — aplikacja bierze pierwszy model z bundla.
-
-- **Mac:** wybierz *My Mac* i naciśnij ⌘R.
-- **iPhone:** *Signing & Capabilities* → Team + unikalny Bundle ID → Tryb dewelopera na telefonie → ⌘R (telefon odblokowany).
-- Pytanie o hasło do pęku kluczy: wpisz hasło do Maca i kliknij *Always Allow*.
-
-**Wymagania:** Xcode 27 · iOS 27 / macOS 26.6+ · iPhone, iPad, Mac.
+**Wymagania:** Xcode 27 · iOS 27 / macOS 26.6+ (jak w projekcie) · Python 3.10–3.12 (Windows) · `tools/geometry/requirements.txt`.

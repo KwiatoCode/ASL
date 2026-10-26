@@ -1,0 +1,9 @@
+# Część Python nowej architektury (Windows / macOS / Linux, Python 3.10–3.12)
+numpy
+opencv-python
+pillow
+scikit-learn
+joblib
+matplotlib
+coremltools          # tylko eksport modelu do aplikacji (export_geometry_coreml.py)
+# mediapipe          # tylko extract_landmarks_mediapipe.py (alternatywny dataset zdjęć)
